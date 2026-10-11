@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "智慧树 AI随堂练习自动作答",
+  "version": "1.2.13",
+  "description": "在智慧树视频播放过程中，自动识别并作答 AI随堂练习弹窗，避免打断播放；视频播完后自动切换下一节课程。",
+  "permissions": ["storage", "debugger"],
+  "host_permissions": ["*://*.zhihuishu.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://*.zhihuishu.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["*://*.zhihuishu.com/*"]
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智慧树自动作答</title>
+  <style>
+    /* 极简风格：仅一个开关，无多余选项 */
+    body {
+      min-width: 200px;
+      margin: 0;
+      padding: 16px 18px;
+      font-family: "Microsoft YaHei", system-ui, sans-serif;
+      font-size: 14px;
+      color: #1f2329;
+      background: #fff;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    /* 自定义复选框外观（保持主流选择框形态） */
+    input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      cursor: pointer;
+      accent-color: #6366f1;
+    }
+  </style>
+</head>
+<body>
+  <!-- 启用自动作答开关：状态存 chrome.storage.local -->
+  <label>
+    <input type="checkbox" id="enableToggle">
+    <span>启用自动作答</span>
+  </label>
+  <script src="popup.js"></script>
+</body>
+</html>
