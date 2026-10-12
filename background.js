@@ -44,7 +44,20 @@ function detachDebugger(debuggee) {
 }
 function dispatchMouse(debuggee, params) {
   return new Promise((resolve, reject) => {
+    // v1.2.29：3 秒超时兜底。开着 F12 时 DevTools 会抢占调试器会话，
+    // sendCommand 可能永不回调（既不成功也不报错），导致 content.js
+    // 等满 15 秒超时才回退合成点击、弹窗长时间卡住。加超时后 3 秒
+    // 内未响应即 reject，content.js 快速走回退路径。
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('dispatchMouse 超时（3s，可能被 F12 抢占调试器）'));
+    }, 3000);
     chrome.debugger.sendCommand(debuggee, 'Input.dispatchMouseEvent', params, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       const err = chrome.runtime.lastError;
       if (err) reject(new Error(err.message));
       else resolve();

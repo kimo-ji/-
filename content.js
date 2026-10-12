@@ -55,7 +55,7 @@
   const CHAPTER_RE = /^第\s*[一二三四五六七八九十百千零〇两\d]+\s*(章|讲|单元|模块)/;
   // 垃圾叶子文本：时长(12:34)、百分比、纯数字、状态词、非视频条目（测试/资料等），
   // 这些不应被当作"小节标题"（避免自动切入测试页或误点导航文字）
-  const JUNK_RE = /^(\d{1,2}:\d{2}(:\d{2})?|\d+([.,]\d+)?%?|已完成|未完成|未开始|学习中|已学完|免费|试看|随堂练习|单元测试|章节测试|测验|作业|考试|资料|讨论|公告|笔记|课件|直播|回放)$/;
+  const JUNK_RE = /^(\d{1,2}:\d{2}(:\d{2})?|\d+([.,]\d+)?%?|已完成|未完成|未开始|学习中|已学完|免费|试看|随堂练习|单元测试|章节测试|测验|作业|考试|资料|讨论|公告|笔记|课件|直播|回放|AI课程导览|课程导览|返回课程|课程目录)$/;
   // "当前正在学习的小节" class 特征词（整词匹配，避免 icon/button 之类误伤）
   const ACTIVE_RE = /^(active|actived|current|cur|selected|on|checked|playing|highlight(ed)?|focus(ed)?)$/i;
 
@@ -80,37 +80,31 @@
 
   // 【修改位置：启动日志】加上版本号——用于一眼确认页面里跑的是哪个版本的
   // 脚本（本次跨章排查发现浏览器缓存了旧版脚本，日志行号与源码对不上）
-  console.log(TAG, 'content script v1.2.20 已加载，所在地址：', location.href);
+  console.log(TAG, 'content script v1.2.29 已加载，所在地址：', location.href);
 
-  // ---------- 注入 isTrusted 覆盖到页面上下文(MAIN world) ----------
-  // 用 <script src="chrome-extension://.../inject.js"> 加载扩展自己的外部脚本。
-  // 关键点：
-  //   - 浏览器加载页面中的 <script src> 时，代码始终在页面主世界(MAIN world)执行；
-  //   - 内联脚本(textContent)会被页面 CSP 的 unsafe-inline 拦截，
-  //     但 chrome-extension:// 下的外部文件不受此限制（已在 manifest 的
-  //     web_accessible_resources 中声明）；
-  //   - 不能用 manifest 的 world:"MAIN"：旧版 Edge 会忽略该配置，
-  //     inject.js 落入隔离世界，虽然共享 DOM 能写标记造成"已注入"假象，
-  //     但 Event.prototype 的覆盖对页面无效（isTrusted 仍为 false）。
-  // 智慧树弹窗选项的点击处理器检查 event.isTrusted，拒绝合成事件，
-  // 覆盖为 true 后 .click()/dispatchEvent 派发的事件能通过校验。
-  (function injectIsTrustedOverride() {
-    if (document.documentElement.dataset.zhihuishuInjected === '1') return; // 已注入则不重复
+  // ---------- isTrusted 覆盖（MAIN world） ----------
+  // v1.2.29：改为 manifest 的 content_scripts + world:"MAIN" 在 document_start
+  // 注入 inject.js。这是 MV3 原生支持的 MAIN world 注入方式，不受页面 CSP 限制
+  // （之前动态 <script src> 注入在新版 Edge 中被 CSP 拦截，覆盖实际无效）。
+  // 智慧树弹窗选项/提交按钮的点击处理器检查 event.isTrusted，拒绝合成事件；
+  // 覆盖为 true 后 .click()/dispatchEvent 派发的事件能通过校验——这样 CDP 不可用
+  // 时（如开着 F12、SW 被杀）合成点击也能正常工作，弹窗不再卡死。
+  // 这里仅做标记检查：若 manifest 注入未生效（极旧版浏览器忽略 world 配置），
+  // 回退到动态 <script src> 注入兜底。
+  (function ensureIsTrustedOverride() {
+    if (document.documentElement.dataset.zhihuishuInjected === '1') {
+      console.log(TAG, 'isTrusted 覆盖已生效（MAIN world 注入）');
+      return;
+    }
+    console.warn(TAG, 'isTrusted 覆盖未生效，尝试动态注入兜底');
     const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('inject.js'); // 外部文件，绕过 CSP unsafe-inline
-    script.onload = function () { this.remove(); }; // 执行完移除标签，避免残留
+    script.src = chrome.runtime.getURL('inject.js');
+    script.onload = function () { this.remove(); };
     script.onerror = function () {
-      console.warn(TAG, 'inject.js 外部脚本加载失败（检查 web_accessible_resources 声明）');
+      console.warn(TAG, 'inject.js 动态注入失败（CDP 将是唯一点击路径）');
     };
     (document.head || document.documentElement).appendChild(script);
   })();
-
-  /**
-   * waitForInjection —— 已废弃：页面 CSP 拦截所有注入（内联被 unsafe-inline 拦，
-   * 外部 chrome-extension:// 脚本也被 script-src 白名单拦），isTrusted 覆盖方案
-   * 整体放弃。现改用 background.js 的 chrome.debugger CDP 真实点击，
-   * 事件由渲染层生成、isTrusted 天生为 true，无需任何页面注入。
-   */
 
   // ---------- 工具函数 ----------
 
@@ -409,8 +403,14 @@
    */
   function realClicks(points) {
     return new Promise((resolve) => {
+      // v1.2.21：15 秒超时，防止 background SW 不响应时 handlePopup 永远卡住
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; console.warn(TAG, 'CDP 点击超时（background 未响应）'); resolve(false); }
+      }, 15000);
       try {
         chrome.runtime.sendMessage({ type: 'cdpClicks', points }, (res) => {
+          if (done) return; done = true; clearTimeout(timer);
           if (chrome.runtime.lastError) {
             console.warn(TAG, 'CDP 消息失败：', chrome.runtime.lastError.message);
             resolve(false);
@@ -424,6 +424,7 @@
           resolve(false);
         });
       } catch (e) {
+        if (!done) { done = true; clearTimeout(timer); }
         console.warn(TAG, 'CDP 消息异常：', e);
         resolve(false);
       }
@@ -443,8 +444,13 @@
    */
   function cdpAttach() {
     return new Promise((resolve) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; console.warn(TAG, 'cdpAttach 超时（background 未响应）'); resolve(false); }
+      }, 15000);
       try {
         chrome.runtime.sendMessage({ type: 'cdpAttach' }, (res) => {
+          if (done) return; done = true; clearTimeout(timer);
           if (chrome.runtime.lastError) {
             console.warn(TAG, 'cdpAttach 消息失败：', chrome.runtime.lastError.message);
             resolve(false);
@@ -453,6 +459,7 @@
           resolve(!!(res && res.ok));
         });
       } catch (e) {
+        if (!done) { done = true; clearTimeout(timer); }
         console.warn(TAG, 'cdpAttach 异常：', e);
         resolve(false);
       }
@@ -576,30 +583,103 @@
     all.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
     return all[0];
   }
+  /**
+   * popupStillPending —— 判定"弹窗仍待提交"（v1.2.23 新增）。
+   * 提交生效的判定：可见的"提交作答"按钮消失，或反馈层（含 正确答案/已提交
+   * 等关键词的结果弹窗）出现，满足其一即视为已生效；
+   * 按钮仍在且反馈层未出现 = 提交未生效（如选项未选中被页面拒绝、点击未落点）。
+   */
+  function popupStillPending(container) {
+    void container; // 参数保留语义来源，实际判定用全文档信号（弹窗可能已重渲染）
+    const btn = findInnermostVisibleByText(document.body, '提交作答');
+    if (!btn) return false;      // 提交按钮消失 = 已提交或已关闭
+    if (findResultModal()) return false; // 反馈层已出现 = 已提交
+    return true;
+  }
+
+  /**
+   * findCloseBtnIn —— 在弹窗/反馈层容器内找通用关闭按钮（v1.2.23 新增）。
+   * 部分反馈层没有"知道了/确定"等文字按钮，只剩右上角一个 X，常见形态：
+   * class 含 close/guanbi 的元素、aria-label/title 为"关闭"、或文字恰为 ×/X。
+   * 该 X 是普通 UI 按钮，不校验 isTrusted，合成 fireClick 即可关闭。
+   */
+  function findCloseBtnIn(root) {
+    if (!root) return null;
+    // 1) class/aria/title 形态（icon-close、close-btn 等均被 class*="close" 覆盖）
+    const candidates = root.querySelectorAll(
+      '[class*="close"],[class*="guanbi"],[aria-label="关闭"],[title="关闭"]'
+    );
+    for (const el of candidates) {
+      if (isVisible(el)) return el;
+    }
+    // 2) 文字恰为 ×/X 的叶子元素（X 图标常是无 class 的纯文本 span）
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
+    while (walker.nextNode()) {
+      const el = walker.currentNode;
+      const t = (el.textContent || '').trim();
+      if ((t === '×' || t === 'X' || t === 'x') && el.children.length === 0 && isVisible(el)) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * findResultModals —— 找全文档所有"结果弹窗"，按文字长度从长到短排序
+   * （v1.2.23 新增）。findResultModal 只返回文字最短的最内层元素，但 X 关闭
+   * 按钮往往在最外层容器上，内层小元素里找不到；本函数大容器优先，专供
+   * 关闭按钮回退查找使用。
+   */
+  function findResultModals() {
+    const all = [...document.querySelectorAll('*')].filter((el) => {
+      if (!isVisible(el)) return false;
+      const style = getComputedStyle(el);
+      if (style.position !== 'fixed' && style.position !== 'absolute') return false;
+      const t = (el.textContent || '').replace(/\s+/g, '');
+      if (!t || t.length > 500) return false;
+      return RESULT_KEYWORDS.some((k) => t.includes(k));
+    });
+    // 文字从长到短：外层容器（含关闭按钮）优先
+    all.sort((a, b) => (b.textContent || '').length - (a.textContent || '').length);
+    return all;
+  }
+
+  /**
+   * closeFeedbackModal —— 关闭"已提交/正确答案"反馈层（v1.2.23 新增，共用）。
+   * 先找文字反馈按钮（知道了/确定/完成等），找不到则回退 X 关闭按钮；
+   * 结果弹窗按大容器优先逐个查找。点中返回 true，未找到返回 false。
+   * dismissFeedback 与 visibilitychange 恢复路径共用本函数。
+   */
+  function closeFeedbackModal(container) {
+    // 1) 文字反馈按钮：先原容器，再最短结果弹窗（保持旧行为）
+    let btn = findFeedbackBtnIn(container);
+    if (!btn) {
+      const shortest = findResultModal();
+      if (shortest) btn = findFeedbackBtnIn(shortest);
+    }
+    // 2) X 关闭按钮回退：原容器 → 各结果弹窗（大容器优先）
+    if (!btn) btn = findCloseBtnIn(container);
+    if (!btn) {
+      for (const modal of findResultModals()) {
+        btn = findCloseBtnIn(modal);
+        if (btn) break;
+      }
+    }
+    if (!btn) return false;
+    console.log(TAG, '点击反馈/关闭按钮：',
+      (btn.textContent || '').trim() || String(btn.className || '').slice(0, 40));
+    fireClick(btn); // 反馈层按钮不校验 isTrusted，合成点击即可
+    return true;
+  }
+
   async function dismissFeedback(container) {
     const tries = 8;        // 最多尝试 8 次
     const interval = 450;   // 每次间隔 450ms，共约 3.6s
     for (let i = 0; i < tries; i++) {
       await new Promise((r) => setTimeout(r, interval));
-      // 1) 原容器范围内找反馈按钮
-      let found = findFeedbackBtnIn(container);
-      // 2) 没找到则找 fixed/absolute 定位的结果弹窗，在其中找反馈按钮
-      if (!found) {
-        const resultModal = findResultModal();
-        if (resultModal) {
-          found = findFeedbackBtnIn(resultModal);
-        }
-      }
-      if (found) {
-        console.log(TAG, '点击反馈按钮：', (found.textContent || '').trim());
-        // v1.2.18：反馈按钮改用合成点击（不附加调试器）。
-        // 反馈按钮（"知道了/确定/完成"等）是普通 UI 按钮，不校验 isTrusted，
-        // 合成点击即可关闭；CDP 仅用于弹窗选项+提交（isTrusted 校验必需）。
-        // 这样反馈阶段不附加调试器，"正在调试浏览器"提示条只在选项+提交
-        // 时短暂出现（约1秒），反馈层处理期间不出现。
-        fireClick(found);
-        return; // 点掉反馈层，结束
-      }
+      // v1.2.23：文字按钮与 X 关闭按钮统一走 closeFeedbackModal
+      // （反馈层可能没有文字按钮，只剩右上角 X）
+      if (closeFeedbackModal(container)) return; // 点掉反馈层，结束
       // 反馈层未出现：可能提交后弹窗直接关闭了
     }
     console.log(TAG, '未发现反馈层（可能已自动关闭）');
@@ -610,7 +690,8 @@
    * 弹窗/反馈层关闭后，部分版本播放器不会自动续播，这里补一刀：
    * 对"播放过（currentTime>0）、未播完（未 ended）、处于暂停"的 video 调
    * play()。play() 是播放器原生 API，不涉及 isTrusted 校验；
-   * 用户此前与页面有过交互（点过播放），一般不会被自动播放策略拦截。
+   * 标签页无用户手势时会被自动播放策略拦截，v1.2.25 起由 tryUnlockPlayback
+   * 静音解锁兜底（muted 自动播放不受策略限制）。
    * 仅在顶层框架才做 CDP 真实点击回退：CDP Input 用的是顶层视口坐标，
    * iframe 内的坐标体系不同，点过去会错位，故 iframe 中只尝试 play()。
    */
@@ -620,22 +701,25 @@
     for (const v of videos) {
       if (!v.paused || v.ended) continue;                      // 在播/已播完的跳过
       if (!(v.currentTime > 0) || !(v.duration > 0)) continue; // 从未播放过的跳过
-      try {
-        await v.play();
+      // v1.2.25：改走 tryUnlockPlayback —— 先有声 play()，被自动播放策略
+      // 拒绝（NotAllowedError）时静音重试（muted 自动播放不受策略限制）。
+      // 标签页无用户手势时（后台挂机）旧版直接 play() 必被拒，视频不恢复。
+      const ok = await tryUnlockPlayback(v);
+      if (ok) {
         console.log(TAG, '已恢复视频播放（play() 成功）');
-      } catch (e) {
-        console.warn(TAG, 'play() 被拒绝：', e && e.message);
-        // 顶层框架回退：对视频中心做一次 CDP 真实点击（等价用户手点恢复）
-        if (isTop) {
-          const r = v.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) {
-            const ok = await realClicks([
-              { x: r.left + r.width / 2, y: r.top + r.height / 2 },
-            ]);
-            console.log(TAG, ok
-              ? 'CDP 点击视频中心完成（回退恢复播放）'
-              : 'CDP 回退点击失败（该页若开着 F12 请关闭）');
-          }
+        continue;
+      }
+      // 静音解锁也失败才走 CDP 点击回退：顶层框架对视频中心做一次
+      // 真实点击（等价用户手点恢复，附带用户激活效果，可恢复出声播放）
+      if (isTop) {
+        const r = v.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          const okCdp = await realClicks([
+            { x: r.left + r.width / 2, y: r.top + r.height / 2 },
+          ]);
+          console.log(TAG, okCdp
+            ? 'CDP 点击视频中心完成（回退恢复播放）'
+            : 'CDP 回退点击失败（该页若开着 F12 请关闭）');
         }
       }
     }
@@ -754,6 +838,24 @@
       // 剔除顶栏课程名、Logo 等位于章节区之外的噪音文字
       const topMin = Math.min(...headers.map((h) => h.getBoundingClientRect().top)) - 60;
       lessons = lessons.filter((l) => l.getBoundingClientRect().top >= topMin);
+      // v1.2.27：章标题行容器黑名单 —— 替换 v1.2.26 的"同行 top 差剔除"。
+      // 侧边栏窄（min(30%,400px)），长章名会换行："第十二章"与"艺术与教育"
+      // 排成两行，top 差 >15px，同行判定失效，章名叶子仍混进 lessons 被当
+      // "下一小节"点击（v1.2.26 实测未根治）。改为 DOM 包含判断：从每个
+      // header 向上找"高度 ≤80px（一行~两行，可容纳换行）"的最近祖先作为
+      // 行容器，凡被行容器 contains 的候选（含裸文本容器、换行章名叶子）
+      // 一律剔除。contains 是纯 DOM 判断，无额外布局读取。
+      const headerRows = [];
+      for (const h of headers) {
+        let row = h; // 找不到合适祖先时兜底用 header 自身
+        for (let n = h.parentElement; n && n !== document.body; n = n.parentElement) {
+          if (n.getBoundingClientRect().height > 80) break; // 超过一行高 = 章容器，停
+          row = n;
+        }
+        headerRows.push(row);
+      }
+      lessons = lessons.filter((l) =>
+        !headerRows.some((row) => row.contains(l)));
     }
     if (!quiet) {
       console.log(TAG, '[自动下一节] 解析侧边栏：章标题数', headers.length,
@@ -1357,8 +1459,18 @@
       console.log(TAG, 'devicePixelRatio（缩放诊断）:', window.devicePixelRatio);
       debugMark(points); // 红点标记点击位置（3 秒消失），肉眼核对是否落在选项圆圈上
 
-      // ---- 第 2 步：CDP 真实点击选项（失败回退合成事件） ----
-      const okClick = await realClicks(points);
+      // ---- 第 2 步：CDP 真实点击选项（失败先重试一次，再回退合成事件） ----
+      // v1.2.23：后台标签页中 setTimeout 被节流，attach 与发点击消息之间可能
+      // 被拉长到 ~30s，MV3 Service Worker 空闲被杀导致调试器会话随之分离、
+      // 首个 cdpClicks 消息响应丢失（日志"CDP 点击超时（background 未响应）"）。
+      // 此时直接回退合成点击等于放弃（选项处理器校验 isTrusted，必被静默忽略），
+      // 故先重试一次 CDP——重试命中新醒来的 SW 会重新附加，通常即可成功。
+      let okClick = await realClicks(points);
+      if (!okClick) {
+        console.warn(TAG, 'CDP 点击选项失败，800ms 后重试一次');
+        await sleep(800);
+        okClick = await realClicks(points);
+      }
       if (okClick) {
         console.log(TAG, 'CDP 真实点击选项完成');
       } else {
@@ -1368,7 +1480,7 @@
 
       // ---- 第 3 步：等待前端状态同步后提交 ----
       await sleep(SELECT_DELAY);
-      const okSubmit = await realClicks([centerOf(submitBtn)]);
+      let okSubmit = await realClicks([centerOf(submitBtn)]);
       if (okSubmit) {
         console.log(TAG, 'CDP 真实点击提交完成');
       } else {
@@ -1377,6 +1489,30 @@
         // 原引用可能已脱离文档导致点击无效（表现为弹窗卡住不提交）
         const fresh = findInnermostVisibleByText(document.body, '提交作答');
         fireClick(fresh || submitBtn);
+      }
+
+      // ---- 第 3.5 步：验证提交真的生效了（v1.2.23 新增） ----
+      // 旧版盲点：CDP 派发成功≠提交生效（如选项没选上时页面 toast 拒绝、
+      // 或点击未落点），日志却继续走"未发现反馈层→恢复视频"，弹窗静默
+      // 残留。现提交后等待并复查：提交按钮仍可见且反馈层未出现 = 未生效，
+      // 重新查找按钮 CDP 重试，最多 2 次；仍失败则明确告警（不再静默），
+      // 留待切回标签页时由 visibilitychange 走完整流程补做。
+      await sleep(1200); // 等提交结果/反馈层渲染
+      let submitRetries = 0;
+      while (popupStillPending(container) && submitRetries < 2) {
+        submitRetries++;
+        console.warn(TAG, '提交未生效，第', submitRetries, '次重试提交');
+        const fresh = findInnermostVisibleByText(document.body, '提交作答');
+        if (!fresh) break; // 按钮已消失（刚关闭），退出重试
+        okSubmit = await realClicks([centerOf(fresh)]);
+        if (!okSubmit) {
+          console.warn(TAG, '重试提交时 CDP 不可用（该页若开着 F12 请关闭），合成点击兜底');
+          fireClick(fresh);
+        }
+        await sleep(1200);
+      }
+      if (popupStillPending(container)) {
+        console.warn(TAG, '提交多次未生效（可能选项未选中或点击未落点），留待切回标签页时补做');
       }
 
       // 提交后冷却：此期间不重新检测，避免弹窗未消失被反复点击
@@ -1493,23 +1629,43 @@
     (async () => {
       console.log(TAG, '标签页恢复可见，处理后台遗留事务…');
 
-      // 1) 补做未执行的提交：检查"提交作答"按钮是否仍可见
-      //    （选项已选中但提交未执行 → 弹窗卡住不消失）
-      const submitBtn = findInnermostVisibleByText(document.body, '提交作答');
-      if (submitBtn) {
-        console.log(TAG, '切回时发现未提交的弹窗，补做提交');
-        fireClick(submitBtn);
-        // 等反馈层出现（切回后 setTimeout 恢复正常速度，300ms 足够）
-        await sleep(300);
+      // 0) 强制重置 processing 标志：如果 handlePopup 卡在某个不返回的 await
+      //    上（如 background SW 不响应），processing 永远为 true，后续检测全跳过。
+      //    切回来时强制重置，让 checkOnce 能重新检测弹窗。
+      if (processing) {
+        console.warn(TAG, '检测到 processing 卡住，强制重置');
+        processing = false;
+      }
+
+      // 1) 补做未提交的弹窗：重走完整 handlePopup（CDP）流程
+      //    v1.2.23 修复：旧版这里用 fireClick 合成点击补提交，但提交按钮
+      //    校验 isTrusted，合成点击被页面静默忽略（点了等于没点），且容器
+      //    已在 processedContainers 里，checkOnce 也不会再处理 → 弹窗永远
+      //    卡死。现改为解除去重标记后重跑完整 CDP 流程（附加调试器→点选项
+      //    →提交→处理反馈层→恢复视频，一步到位）。
+      const popup = detectPopup();
+      if (popup) {
+        console.log(TAG, '切回时发现未提交的弹窗，走完整 CDP 流程补做');
+        processedContainers.delete(popup.container); // 解除"同一容器只处理一次"标记
+        lastSignature = '';                          // 解除文字签名+5秒时间窗去重
+        lastProcessTime = 0;
+        processing = true;                           // 防止轮询/observer 并发重入
+        try {
+          await handlePopup(popup);
+        } finally {
+          processing = false;
+        }
       }
 
       // 2) 关闭遗留的反馈层（弹窗已提交但反馈层未消失）
-      const resultModal = findResultModal();
-      if (resultModal) {
-        const btn = findFeedbackBtnIn(resultModal);
-        if (btn) {
-          console.log(TAG, '关闭遗留的反馈层');
-          fireClick(btn);
+      //    v1.2.23：统一走 closeFeedbackModal——旧版只找文字按钮，反馈层仅有
+      //    右上角 X 时会静默跳过（无日志），反馈层永远关不掉、视频被压着不播
+      const leftover = findResultModal();
+      if (leftover) {
+        if (closeFeedbackModal(leftover)) {
+          console.log(TAG, '已关闭遗留的反馈层');
+        } else {
+          console.warn(TAG, '检测到反馈层但未找到可点的关闭按钮');
         }
       }
 
@@ -1567,6 +1723,38 @@
       });
     } catch (e) { /* runtime 失效忽略 */ }
   }
+  /**
+   * tryUnlockPlayback（v1.2.25）—— 自动播放策略解锁。
+   * 标签页没有真实用户手势时（后台连播场景），浏览器自动播放策略会拒绝
+   * 有声 play()（NotAllowedError，v1.2.24 实测：页面播放器抛
+   * "play() failed because the user didn't interact with the document first"），
+   * 视频永远 paused，元数据也可能不加载（preload=none），探测永远等不到
+   * "可播放视频" → 判定切换失败 → 连点候选直至放弃，页面卡死。
+   * 注意：CDP 点击虽然 isTrusted=true，但不计入浏览器"用户激活"，解锁不了
+   * 自动播放策略；唯一豁免路径是静音 —— muted 自动播放始终被允许。
+   * 流程：先试有声 play()（标签页有手势历史时保持正常出声），
+   * 被策略拒绝则静音后重试。返回 true 表示视频已（或即将）开始播放。
+   */
+  async function tryUnlockPlayback(v) {
+    if (!v || v.ended) return false;   // 已播完的不再强行拉起
+    if (!v.paused) return true;        // 已在播放，无需解锁
+    try {
+      await v.play();                  // 先试有声播放（不破坏正常前台体验）
+      return true;
+    } catch (e) {
+      // 仅处理自动播放策略拒绝；其他错误（如解码失败）交由原流程处理
+      if (!(e && e.name === 'NotAllowedError')) return false;
+      try {
+        v.muted = true;                // 静音豁免：浏览器策略允许 muted 自动播放
+        await v.play();
+        console.log(TAG, '有声自动播放被策略拦截（标签页无用户手势），已静音解锁播放');
+        return true;
+      } catch (e2) {
+        console.warn(TAG, '静音解锁播放仍失败：', e2 && e2.message);
+        return false;
+      }
+    }
+  }
   // 后台标签页 setTimeout 被节流（静音且隐藏超 5 分钟可被钳到 1 次/分钟），
   // 纯轮询探测在后台会失真：点击切课后探测不到新视频 → 每轮点下一个候选
   // → 跳号（v1.2.13 实测从 2.2.1 直接跳到 2.3.5 的根因）。
@@ -1601,6 +1789,14 @@
   // 各框架的 content script 各自恢复本地 video，已在播的会被自动跳过）
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === 'videoProbeRun') {
+      // v1.2.25：先对本框架 paused 的视频发起自动播放解锁。标签页无用户手势时
+      // 播放器的 play() 被策略拒绝，视频永远 paused、元数据可能不加载，
+      // 探测永远等不到可播视频 → 误判切换失败连点候选直至卡死。
+      // 解锁成功后 play/playing/loadedmetadata 媒体事件会触发 armMediaProbe 回报，
+      // 无需在此同步等待（解锁是异步的，回报走既有事件驱动链路）。
+      for (const v of document.querySelectorAll('video')) {
+        tryUnlockPlayback(v); // 异步发起，不阻塞下方立即自查
+      }
       // 立即自查一次并回报
       const hasVideo = localHasPlayableVideo();
       reportProbeResult(hasVideo);
