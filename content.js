@@ -59,9 +59,28 @@
   // "当前正在学习的小节" class 特征词（整词匹配，避免 icon/button 之类误伤）
   const ACTIVE_RE = /^(active|actived|current|cur|selected|on|checked|playing|highlight(ed)?|focus(ed)?)$/i;
 
+  // v1.2.15：扩展上下文失效检测。
+  // 插件在页面打开期间被重载/更新后，页面里的旧 content script 与插件断开
+  // （chrome.runtime 全部抛 "Extension context invalidated"），此时 CDP 不可用、
+  // 消息发不出去，脚本已无法完成任何功能，且会无限重试刷屏。
+  // 检测到即停止全部监听，并输出醒目提示要求刷新页面。
+  let ctxDead = false;
+  function isCtxDeadError(e) {
+    return /Extension context invalidated/i.test(String((e && e.message) || e));
+  }
+  function markCtxDead() {
+    if (ctxDead) return;
+    ctxDead = true;
+    stopObserver(); // 停掉 observer + 轮询 + 播完监视，终结重试循环
+    console.error(TAG, '════════════════════════════════════════════');
+    console.error(TAG, '扩展上下文已失效：插件在页面打开期间被重载/更新。');
+    console.error(TAG, '旧脚本无法恢复工作，请按 F5 刷新学习页面。');
+    console.error(TAG, '════════════════════════════════════════════');
+  }
+
   // 【修改位置：启动日志】加上版本号——用于一眼确认页面里跑的是哪个版本的
   // 脚本（本次跨章排查发现浏览器缓存了旧版脚本，日志行号与源码对不上）
-  console.log(TAG, 'content script v1.2.13 已加载，所在地址：', location.href);
+  console.log(TAG, 'content script v1.2.20 已加载，所在地址：', location.href);
 
   // ---------- 注入 isTrusted 覆盖到页面上下文(MAIN world) ----------
   // 用 <script src="chrome-extension://.../inject.js"> 加载扩展自己的外部脚本。
@@ -573,8 +592,12 @@
       }
       if (found) {
         console.log(TAG, '点击反馈按钮：', (found.textContent || '').trim());
-        const ok = await realClicks([centerOf(found)]); // CDP 真实点击优先
-        if (!ok) fireClick(found); // 失败回退合成事件
+        // v1.2.18：反馈按钮改用合成点击（不附加调试器）。
+        // 反馈按钮（"知道了/确定/完成"等）是普通 UI 按钮，不校验 isTrusted，
+        // 合成点击即可关闭；CDP 仅用于弹窗选项+提交（isTrusted 校验必需）。
+        // 这样反馈阶段不附加调试器，"正在调试浏览器"提示条只在选项+提交
+        // 时短暂出现（约1秒），反馈层处理期间不出现。
+        fireClick(found);
         return; // 点掉反馈层，结束
       }
       // 反馈层未出现：可能提交后弹窗直接关闭了
@@ -832,7 +855,7 @@
   async function cdpClickElement(el, label) {
     try { el.scrollIntoView({ block: 'center' }); } catch (e) { /* 忽略 */ }
     await sleep(200); // 等滚动与布局落定
-    const attached = await cdpAttach();
+    let attached = await cdpAttach(); // v1.2.20：改为 let，提交后需置 false
     if (attached) {
       await sleep(150);
       await waitForRectStable(el); // 提示条位移/展开动画结束后再量坐标
@@ -1115,6 +1138,14 @@
    *    或 4 轮都没有可播视频（课程结构异常）放弃。
    */
   async function goToNextLesson() {
+    // v1.2.17：每次新导航开始时清空 clickedTargets。
+    // v1.2.13 只在导航成功后清空，但导航失败（4轮都没有视频）时不清空，
+    // 导致 30 秒冷却到期后重新触发 goToNextLesson 时，上次试过的目标
+    // （如 2.7小结、测试、3.1 等无视频/视频未加载的条目）被永久跳过，
+    // clickedTargets 不断累积，最终跳到很远的地方（实测从 2.6 跳到 14.1）。
+    // 每次新导航从干净状态开始，单次调用内 navViaSidebar 仍可用 clickedTargets
+    // 防死循环（点进无视频大节后跳过已试目标，点下一个），调用结束自动失效。
+    clickedTargets = new WeakSet();
     for (let round = 1; round <= 4; round++) {
       if (round > 1) {
         console.log(TAG, '[自动下一节] 第 ' + round + ' 轮：尚未进入有视频的页面，尝试下一个候选…');
@@ -1143,11 +1174,7 @@
       // 点击已发出（无论签名验证是否确认）→ 以视频探测为准判断是否切成功
       if (await waitForVideoProbe(8000)) {
         console.log(TAG, '[自动下一节] 新页面已有可播视频，自动切换完成');
-        // v1.2.13：导航成功 → 清空 clickedTargets。
-        // 这些目标只是本次导航过程中"试过"的候选，到达新页面后已无意义；
-        // 若不清空，下一次视频播完时它们会被当作"已点击"永久跳过，
-        // 导致跳过未播放的小节直接跳到更后面的课。
-        clickedTargets = new WeakSet();
+        // v1.2.17：clickedTargets 已在函数开头清空，这里无需再清
         return;
       }
       console.log(TAG, '[自动下一节] 新页面没有可播视频（可能进了目录层大节/导览条目），继续下一个候选');
@@ -1156,21 +1183,57 @@
   }
 
   /**
+   * waitResumeCheck（v1.2.16）—— 播完复核改为"事件驱动 + 超时兜底"。
+   * 旧实现 await sleep(4000) 后一次性检查：后台标签页 setTimeout 被节流
+   * （静音且隐藏超 5 分钟可被钳到 1 次/分钟），复核和后续导航都会被大幅拖慢。
+   * 改为监听媒体事件（play/playing/timeupdate，不受定时器节流影响）：
+   *   - 窗口期内视频恢复播放（未暂停、未到结尾）→ 立即判定分段连播，取消切换；
+   *   - 窗口到期仍无恢复 → 播完成立（后台节流只会拉长窗口，不会误判）。
+   */
+  function waitResumeCheck(v, ms) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (resumed) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        v.removeEventListener('play', check);
+        v.removeEventListener('playing', check);
+        v.removeEventListener('timeupdate', check);
+        resolve(resumed);
+      };
+      const check = () => {
+        if (!v.paused && !v.ended && v.duration > 0 && v.currentTime < v.duration - 1) {
+          finish(true);
+        }
+      };
+      const timer = setTimeout(() => finish(false), ms);
+      v.addEventListener('play', check);
+      v.addEventListener('playing', check);
+      v.addEventListener('timeupdate', check);
+    });
+  }
+
+  /**
    * confirmVideoEnd —— 播完确认（防止小节内多段视频自动连播造成误触发）。
-   * 触发后等 4 秒复核：若播放器已自动续播下一段（恢复播放、进度未到结尾），
-   * 说明还没到小节末尾，取消切换；仍处于播完暂停状态才广播切换请求。
+   * 触发后用 waitResumeCheck 复核 4 秒：若播放器已自动续播下一段（恢复播放、
+   * 进度未到结尾），说明还没到小节末尾，取消切换；仍处于播完状态才广播切换请求。
    * 发出请求前设 30 秒冷却，防止切换失败后每 2 秒重试形成风暴。
    */
   async function confirmVideoEnd(v) {
-    await sleep(4000);
-    const resumed = !v.paused && !v.ended && v.duration > 0 && v.currentTime < v.duration - 1;
+    const resumed = await waitResumeCheck(v, 4000);
     if (resumed) {
-      console.log(TAG, '视频 4 秒后恢复播放（小节内分段连播），不切换下一节');
+      console.log(TAG, '视频复核期内恢复播放（小节内分段连播），不切换下一节');
       pendingEndVideos.delete(v);
       return;
     }
     console.log(TAG, '确认视频已播完当前小节 → 请求切换下一节');
     pendingEndVideos.delete(v);
+
+    // v1.2.16：后台标签页也照常切换。v1.2.14 曾在后台延后导航（navPending），
+    // 但用户实际需要后台自动连播；跳号的根因（后台定时器节流导致轮询探测
+    // 失真）已由媒体事件驱动的探测回报解决，无需再延后（navPending 已移除）。
+
     // 30 秒冷却仅约束 videoEndPoll 的重新扫描（防切换失败后每 2 秒重试风暴），
     // 千万不能用它拦截 navigateNext 处理器：若视频与侧边栏同在顶层框架，
     // 刚设的冷却会把广播回来的切换请求"自己拦掉自己"（v1.2.6 实测踩坑）
@@ -1178,12 +1241,14 @@
     try {
       chrome.runtime.sendMessage({ type: 'videoEnded' }, () => {
         if (chrome.runtime.lastError) {
-          console.error(TAG, 'videoEnded 发送失败（若刚在扩展页重载过插件，请刷新学习页面）：',
-            chrome.runtime.lastError.message);
+          const m = chrome.runtime.lastError.message || '';
+          console.error(TAG, 'videoEnded 发送失败（若刚在扩展页重载过插件，请刷新学习页面）：', m);
+          if (isCtxDeadError(m)) markCtxDead(); // v1.2.15：上下文失效 → 停止重试循环
         }
       });
     } catch (e) {
       console.error(TAG, 'videoEnded 发送异常（若刚在扩展页重载过插件，请刷新学习页面）：', e);
+      if (isCtxDeadError(e)) markCtxDead(); // v1.2.15：上下文失效 → 停止重试循环
     }
   }
 
@@ -1193,7 +1258,7 @@
    * pendingEndVideos 保证同一 video 只触发一次确认流程。
    */
   function videoEndPoll() {
-    if (!enabled || processing) return;       // 开关关闭/弹窗处理中不监视
+    if (ctxDead || !enabled || processing) return; // v1.2.15：上下文失效/关闭/处理中不监视
     if (Date.now() < navCooldownUntil) return; // 冷却期内不触发
     for (const v of document.querySelectorAll('video')) {
       if (v.duration > 0 && (v.ended || v.currentTime >= v.duration - 0.3)
@@ -1263,7 +1328,7 @@
     //      位置。因此用"连续两次采样位置一致"判断真正静止，比固定延时可靠。
     // 附加成功后调试器保持附加到整个流程结束（finally 里统一分离），
     // 中途不再附加/分离，布局不会再次位移。
-    const attached = await cdpAttach();
+    let attached = await cdpAttach(); // v1.2.20：改为 let，提交后需置 false
     console.log(TAG, attached
       ? '调试器已附加（浏览器顶部出现调试提示条属正常现象）'
       : '调试器附加失败（该页若开着 F12 请先关闭），稍后回退合成点击');
@@ -1308,13 +1373,25 @@
         console.log(TAG, 'CDP 真实点击提交完成');
       } else {
         console.warn(TAG, '提交回退合成点击');
-        fireClick(submitBtn);
+        // v1.2.15：重新查找提交按钮——选中选项后 Vue 可能重渲染弹窗，
+        // 原引用可能已脱离文档导致点击无效（表现为弹窗卡住不提交）
+        const fresh = findInnermostVisibleByText(document.body, '提交作答');
+        fireClick(fresh || submitBtn);
       }
 
       // 提交后冷却：此期间不重新检测，避免弹窗未消失被反复点击
       cooldownUntil = Date.now() + COOLDOWN;
 
-      // 处理反馈层，让视频恢复播放（此时调试器仍附加，坐标不会漂移）
+      // v1.2.14：提交后立即分离调试器 → 反馈层改用合成点击
+      // 原设计在 dismissFeedback 全程保持调试器附加（约 3.6s），导致"正在调试浏览器"
+      // 提示条长时间显示在用户当前使用的标签页上。分离后 dismissFeedback 中
+      // realClicks 会自行快速附加/分离（~200ms），提示条只短暂闪烁
+      if (attached) {
+        await cdpDetach();
+        attached = false; // 标记已分离，finally 块不再重复分离
+      }
+
+      // 处理反馈层（realClicks 会自行附加/分离调试器，合成点击 fireClick 不需要调试器）
       await dismissFeedback(container);
 
       // ---- 第 4 步：恢复被弹窗暂停的视频（v1.2.3 新增） ----
@@ -1352,6 +1429,7 @@
    * 提交后冷却期内不检测，防止弹窗未消失被反复点击。
    */
   function checkOnce() {
+    if (ctxDead) return; // v1.2.15：上下文已失效，停止一切检测
     if (!enabled || processing) return;
     if (Date.now() < cooldownUntil) return; // 冷却期内跳过
     const popup = detectPopup();
@@ -1394,6 +1472,57 @@
     console.log(TAG, '监听已停止');
   }
 
+  /**
+   * visibilitychange 监听器（v1.2.14 新增，v1.2.16 调整）—— 标签页恢复可见时
+   * 立即处理后台标签页的遗留事务：
+   *   1. 补做未执行的提交（后台 setTimeout 被节流，SELECT_DELAY 被拉长
+   *      到几十秒，选项已选中但提交未执行 → 弹窗卡住不消失）
+   *   2. 关闭遗留的反馈层（后台 setTimeout 被节流，dismissFeedback 的重试
+   *      窗口内可能找不到按钮，反馈层残留导致视频暂停）
+   *   3. 恢复暂停的视频（后台 video.play() 可能被浏览器自动播放策略拒绝）
+   *   4. 常规补检一次弹窗+视频（后台 setInterval 被节流可能漏检）；
+   *      v1.2.16 起后台照常自动切课（媒体事件驱动探测），无需延后导航
+   */
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (ctxDead) {
+      console.warn(TAG, '扩展上下文已失效，无法处理遗留事务，请按 F5 刷新页面');
+      return;
+    }
+    // v1.2.19：用 async IIFE 包装，支持补做提交后等反馈层出现
+    (async () => {
+      console.log(TAG, '标签页恢复可见，处理后台遗留事务…');
+
+      // 1) 补做未执行的提交：检查"提交作答"按钮是否仍可见
+      //    （选项已选中但提交未执行 → 弹窗卡住不消失）
+      const submitBtn = findInnermostVisibleByText(document.body, '提交作答');
+      if (submitBtn) {
+        console.log(TAG, '切回时发现未提交的弹窗，补做提交');
+        fireClick(submitBtn);
+        // 等反馈层出现（切回后 setTimeout 恢复正常速度，300ms 足够）
+        await sleep(300);
+      }
+
+      // 2) 关闭遗留的反馈层（弹窗已提交但反馈层未消失）
+      const resultModal = findResultModal();
+      if (resultModal) {
+        const btn = findFeedbackBtnIn(resultModal);
+        if (btn) {
+          console.log(TAG, '关闭遗留的反馈层');
+          fireClick(btn);
+        }
+      }
+
+      // 3) 恢复暂停的视频
+      resumeVideo();
+
+      // 4) 补检一次弹窗+视频（后台节流期间可能漏检；
+      //    v1.2.16 起后台照常自动切课，无需再处理延后的切换）
+      checkOnce();
+      videoEndPoll();
+    })();
+  });
+
   // ---------- 开关状态同步 ----------
 
   /**
@@ -1419,24 +1548,66 @@
     }
   });
 
+  // ---------- 视频探测辅助（v1.2.16） ----------
+  // 本框架"存在可播放视频"判定（立即自查与媒体事件回报共用）。
+  // 判定"存在可播放的新视频"——duration>0 且未播完且未到结尾；
+  // 不能只判"存在 video 元素"：发起切换的当前页视频已播完但元素还在，
+  // 会误判为"新页面有视频"；导览页/大节页则根本没有 video 元素
+  function localHasPlayableVideo() {
+    try {
+      return Array.prototype.some.call(
+        document.querySelectorAll('video'),
+        (v) => v.duration > 0 && !v.ended && v.currentTime < v.duration - 1);
+    } catch (e) { return false; } // 查询失败按无视频处理
+  }
+  function reportProbeResult(hasVideo) {
+    try {
+      chrome.runtime.sendMessage({ type: 'videoProbeResult', hasVideo }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (e) { /* runtime 失效忽略 */ }
+  }
+  // 后台标签页 setTimeout 被节流（静音且隐藏超 5 分钟可被钳到 1 次/分钟），
+  // 纯轮询探测在后台会失真：点击切课后探测不到新视频 → 每轮点下一个候选
+  // → 跳号（v1.2.13 实测从 2.2.1 直接跳到 2.3.5 的根因）。
+  // 媒体事件（play/playing/loadedmetadata/timeupdate）由播放行为直接触发，
+  // 不受定时器节流影响：挂上捕获监听，新视频一加载/播放立即回报。
+  let mediaProbeStop = null; // 当前生效监听的拆除函数（同一框架只挂一份）
+  function armMediaProbe(waitMs) {
+    if (mediaProbeStop) return; // 已有监听生效，无需重复挂
+    function check() {
+      if (localHasPlayableVideo()) {
+        stop();
+        reportProbeResult(true);
+      }
+    }
+    function stop() {
+      mediaProbeStop = null;
+      document.removeEventListener('play', check, true);
+      document.removeEventListener('playing', check, true);
+      document.removeEventListener('loadedmetadata', check, true);
+      document.removeEventListener('timeupdate', check, true);
+    }
+    mediaProbeStop = stop;
+    // 媒体事件不冒泡，必须用捕获阶段监听才能在 document 上截获 video 的事件
+    document.addEventListener('play', check, true);
+    document.addEventListener('playing', check, true);
+    document.addEventListener('loadedmetadata', check, true);
+    document.addEventListener('timeupdate', check, true);
+    setTimeout(() => { if (mediaProbeStop === stop) stop(); }, waitMs);
+  }
+
   // 接收 background 广播：本框架内恢复视频（播放器可能在 iframe 中，
   // 各框架的 content script 各自恢复本地 video，已在播的会被自动跳过）
   chrome.runtime.onMessage.addListener((msg) => {
-    // v1.2.12：判定"存在可播放的新视频"——duration>0 且未播完且未到结尾。
-    // 不能只判"存在 video 元素"：发起切换的当前页视频已播完但元素还在，
-    // 会误判为"新页面有视频"；导览页/大节页则根本没有 video 元素
     if (msg && msg.type === 'videoProbeRun') {
-      let hasVideo = false;
-      try {
-        hasVideo = Array.prototype.some.call(
-          document.querySelectorAll('video'),
-          (v) => v.duration > 0 && !v.ended && v.currentTime < v.duration - 1);
-      } catch (e) { /* 查询失败按无视频处理 */ }
-      try {
-        chrome.runtime.sendMessage({ type: 'videoProbeResult', hasVideo }, () => {
-          void chrome.runtime.lastError;
-        });
-      } catch (e) { /* runtime 失效忽略 */ }
+      // 立即自查一次并回报
+      const hasVideo = localHasPlayableVideo();
+      reportProbeResult(hasVideo);
+      // 没有视频时挂媒体事件监听（v1.2.16）：后台标签页轮询探测会因定时器
+      // 节流失真，新页面视频加载/播放时由媒体事件立即触发回报；
+      // 15 秒窗口覆盖 SPA 渲染 + 播放器 iframe 加载的慢速场景
+      if (!hasVideo) armMediaProbe(15000);
       return; // 不回包，报告走独立消息
     }
     // v1.2.9：视频探测报告 —— 仅顶层框架收集，任一框架有视频即放行等待中的探测
